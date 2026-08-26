@@ -294,16 +294,16 @@ export default class extends Controller {
       }
       if (dialogStillClosing) {
         try { dialog.remove(); } catch (_) {}
+        delete dialog.dataset.utmrHistoryAdvanced;
+        delete dialog.dataset.utmrSkipHistoryBack;
+        this.#releaseScrollbarCompensation();
       }
-      delete dialog.dataset.utmrHistoryAdvanced;
-      delete dialog.dataset.utmrSkipHistoryBack;
-      this.#releaseScrollbarCompensation();
-      if (frameStillOurs) this.#resetHistoryAdvanced();
+      if (dialogStillClosing && frameStillOurs) this.#resetHistoryAdvanced();
       try { frame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
 
       // Go back in history AFTER the dialog is removed and animation is done.
       // This triggers Turbo's popstate navigation to restore the previous page.
-      if (historyWasAdvanced && !this._skipHistoryBack) history.back();
+      if (dialogStillClosing && historyWasAdvanced && !this._skipHistoryBack) history.back();
     };
 
     const onTransitionEnd = (e) => {
