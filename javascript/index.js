@@ -139,6 +139,10 @@ const handleTurboFrameMissing = (event) => {
   performSmoothRedirect(modal, redirectUrl);
 };
 
+// Dialog state the controller owns at runtime and the server never renders, so
+// a morph must not treat its absence from the response as "remove this".
+const LIVE_DIALOG_ATTRIBUTES = new Set(['open', 'data-enter-ready', 'data-entered']);
+
 // Intercept frame renders for modal frames to use Idiomorph for flicker-free updates.
 // When turbo:before-frame-render fires, the response *contains* the modal frame,
 // so it's valid modal content (e.g., a wizard step or in-modal navigation).
@@ -160,9 +164,20 @@ const handleTurboBeforeFrameRender = (event) => {
 
   // Morph subsequent in-frame updates to prevent flicker and avoid re-running
   // enter transitions on an already-open dialog.
+  //
+  // `open`, `data-enter-ready` and `data-entered` have to survive the morph.
+  // They are live state written by the controller and the server never renders
+  // them, so a plain morph removes all three from a dialog that is currently on
+  // screen. The node is reused, so Stimulus does not reconnect, nothing calls
+  // showModal() again, and the dialog is left in the DOM at `display: none` --
+  // the modal simply disappears, with no error.
   event.detail.render = (currentElement, newElement) => {
     Idiomorph.morph(currentElement, Array.from(newElement.childNodes), {
-      morphStyle: 'innerHTML'
+      morphStyle: 'innerHTML',
+      callbacks: {
+        beforeAttributeUpdated: (attributeName, node) =>
+          !(node.tagName === 'DIALOG' && LIVE_DIALOG_ATTRIBUTES.has(attributeName))
+      }
     });
   };
 };

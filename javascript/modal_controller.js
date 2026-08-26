@@ -260,6 +260,11 @@ export default class extends Controller {
     const dialog = this.containerTarget;
     const transitionTarget = this.#transitionTarget();
     const closeTimeoutMs = this.#isDrawer() ? 750 : 300;
+    // The frame src this close belongs to. The cleanup below runs up to
+    // closeTimeoutMs later, after the leave transition -- by which time the
+    // user may have opened another modal, giving the frame a new src with a
+    // fetch in flight.
+    const closingSrc = this.turboFrame?.getAttribute("src") ?? null;
     this.#cancelCloseCleanup();
 
     let cleaned = false;
@@ -269,13 +274,31 @@ export default class extends Controller {
       this.#cancelCloseCleanup();
       window.removeEventListener('popstate', this.popstateHandler);
       const frame = this.turboFrame;
-      try { dialog.close(); } catch (_) {}
-      try { frame.removeAttribute("src"); } catch (_) {}
-      try { dialog.remove(); } catch (_) {}
+      // Only clean up what still belongs to THIS close. If another modal has
+      // taken the frame over, its src is an in-flight fetch and the body's
+      // history-advanced flag is its close bookkeeping -- stripping either
+      // swallows the new modal's open, or leaves its close unable to consume
+      // its history entry.
+      const frameStillOurs = frame?.getAttribute("src") === closingSrc;
+      // The dialog node is not reliably ours either. handleTurboBeforeFrameRender
+      // morphs in-frame updates onto the existing dialog, so a newer modal can
+      // be living in the very node this close was started on. data-closing is
+      // the tell: #applyClosingState sets it when the close begins and the
+      // server never renders it, so a morph removes it.
+      const dialogStillClosing = dialog.hasAttribute("data-closing");
+      if (dialogStillClosing) {
+        try { dialog.close(); } catch (_) {}
+      }
+      if (frameStillOurs) {
+        try { frame.removeAttribute("src"); } catch (_) {}
+      }
+      if (dialogStillClosing) {
+        try { dialog.remove(); } catch (_) {}
+      }
       delete dialog.dataset.utmrHistoryAdvanced;
       delete dialog.dataset.utmrSkipHistoryBack;
       this.#releaseScrollbarCompensation();
-      this.#resetHistoryAdvanced();
+      if (frameStillOurs) this.#resetHistoryAdvanced();
       try { frame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
 
       // Go back in history AFTER the dialog is removed and animation is done.
