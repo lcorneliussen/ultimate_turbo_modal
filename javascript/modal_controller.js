@@ -291,7 +291,6 @@ export default class extends Controller {
       if (cleaned) return;
       cleaned = true;
       this.#cancelCloseCleanup();
-      window.removeEventListener('popstate', this.popstateHandler);
       const frame = this.turboFrame;
       // Only clean up what still belongs to THIS close. If another modal has
       // taken the frame over, its src is an in-flight fetch and the body's
@@ -305,6 +304,7 @@ export default class extends Controller {
       // the tell: #applyClosingState sets it when the close begins and the
       // server never renders it, so a morph removes it.
       const dialogStillClosing = dialog.hasAttribute("data-closing");
+      if (dialogStillClosing) window.removeEventListener('popstate', this.popstateHandler);
       if (dialogStillClosing) {
         try { dialog.close(); } catch (_) {}
       }
@@ -318,7 +318,9 @@ export default class extends Controller {
         this.#releaseScrollbarCompensation();
       }
       if (dialogStillClosing && frameStillOurs) this.#resetHistoryAdvanced();
-      try { frame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
+      if (dialogStillClosing && frameStillOurs) {
+        try { frame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
+      }
 
       // Go back in history AFTER the dialog is removed and animation is done.
       // This triggers Turbo's popstate navigation to restore the previous page.
