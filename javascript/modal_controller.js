@@ -159,6 +159,25 @@ export default class extends Controller {
     this.hideModal();
   }
 
+  reviveAfterFrameMorph() {
+    this.#cancelResumeClosing();
+    this.#cancelCloseCleanup();
+    this.hidingModal = false;
+    this._skipHistoryBack = false;
+    this.containerTarget.removeAttribute('data-closing');
+    delete this.containerTarget.dataset.utmrHistoryAdvanced;
+    delete this.containerTarget.dataset.utmrSkipHistoryBack;
+
+    if (!this.containerTarget.open) {
+      this.showModal();
+      return;
+    }
+
+    this.#adoptScrollLock();
+    this.containerTarget.setAttribute('data-enter-ready', '');
+    this.containerTarget.setAttribute('data-entered', '');
+  }
+
   refreshPage() {
     window.Turbo.visit(window.location.href, { action: "replace" });
   }

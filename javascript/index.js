@@ -161,6 +161,7 @@ const handleTurboBeforeFrameRender = (event) => {
   // Empty modal frames are initial loads. Let Turbo do its normal child
   // replacement so Stimulus sees a plain insertion and owns dialog opening.
   if (event.target.children.length === 0) return;
+  const wasClosing = event.target.querySelector('dialog.utmr[data-closing]') !== null;
 
   // Morph subsequent in-frame updates to prevent flicker and avoid re-running
   // enter transitions on an already-open dialog.
@@ -179,6 +180,7 @@ const handleTurboBeforeFrameRender = (event) => {
           !(node.tagName === 'DIALOG' && LIVE_DIALOG_ATTRIBUTES.has(attributeName))
       }
     });
+    if (wasClosing) modal?.reviveAfterFrameMorph?.();
   };
 };
 
