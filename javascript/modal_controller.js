@@ -324,7 +324,7 @@ export default class extends Controller {
 
       // Go back in history AFTER the dialog is removed and animation is done.
       // This triggers Turbo's popstate navigation to restore the previous page.
-      if (dialogStillClosing && historyWasAdvanced && !this._skipHistoryBack) history.back();
+      if (dialogStillClosing && frameStillOurs && historyWasAdvanced && !this._skipHistoryBack) history.back();
     };
 
     const onTransitionEnd = (e) => {
