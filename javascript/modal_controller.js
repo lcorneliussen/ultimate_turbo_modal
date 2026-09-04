@@ -172,22 +172,32 @@ export default class extends Controller {
   }
 
   reviveAfterFrameMorph() {
+    const wasClosing = this.hidingModal;
     this.#cancelResumeClosing();
     this.#cancelCloseCleanup();
+    if (this.#frameOwnsCloseToken(this.turboFrame, this._closeToken)) {
+      delete this.turboFrame.dataset.utmrCloseToken;
+    }
+    this._closeToken = null;
     this.hidingModal = false;
     this._skipHistoryBack = false;
     this.containerTarget.removeAttribute('data-closing');
+    delete this.containerTarget.dataset.utmrCloseToken;
     delete this.containerTarget.dataset.utmrHistoryAdvanced;
     delete this.containerTarget.dataset.utmrSkipHistoryBack;
 
     if (!this.containerTarget.open) {
       this.showModal();
-      return;
+    } else {
+      this.#adoptScrollLock();
+      this.containerTarget.setAttribute('data-enter-ready', '');
+      this.containerTarget.setAttribute('data-entered', '');
     }
 
-    this.#adoptScrollLock();
-    this.containerTarget.setAttribute('data-enter-ready', '');
-    this.containerTarget.setAttribute('data-entered', '');
+    // Supersession finishes this close even though the reused dialog stays open.
+    if (wasClosing) {
+      try { this.turboFrame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
+    }
   }
 
   refreshPage() {
@@ -273,7 +283,9 @@ export default class extends Controller {
   #resumeClosing() {
     const historyWasAdvanced = this.containerTarget.dataset.utmrHistoryAdvanced == 'true';
     this._skipHistoryBack = this.containerTarget.dataset.utmrSkipHistoryBack == 'true';
-    const closeToken = this.turboFrame?.dataset.utmrCloseToken || this.#stampCloseToken();
+    // Reconnecting cannot reclaim a frame that a newer request already owns.
+    const closeToken = this.containerTarget.dataset.utmrCloseToken;
+    this._closeToken = closeToken;
 
     // Same-page morphs can reconnect the controller mid-close before the browser
     // has committed the leave transition. Re-arm the closing state on the
@@ -308,6 +320,7 @@ export default class extends Controller {
   #stampCloseToken() {
     const closeToken = String(++closeTokenSequence);
     this._closeToken = closeToken;
+    this.containerTarget.dataset.utmrCloseToken = closeToken;
     if (this.turboFrame) this.turboFrame.dataset.utmrCloseToken = closeToken;
     return closeToken;
   }
@@ -340,6 +353,7 @@ export default class extends Controller {
         window.removeEventListener('popstate', this.popstateHandler);
         try { dialog.close(); } catch (_) {}
         try { dialog.remove(); } catch (_) {}
+        delete dialog.dataset.utmrCloseToken;
         delete dialog.dataset.utmrHistoryAdvanced;
         delete dialog.dataset.utmrSkipHistoryBack;
         this.#releaseScrollbarCompensation();
