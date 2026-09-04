@@ -141,7 +141,17 @@ const handleTurboFrameMissing = (event) => {
 
 // Dialog state the controller owns at runtime and the server never renders, so
 // a morph must not treat its absence from the response as "remove this".
-const LIVE_DIALOG_ATTRIBUTES = new Set(['open', 'data-enter-ready', 'data-entered']);
+//
+// data-closing is intentionally omitted. The close cleanup uses a morph that
+// removes data-closing as the signal that this dialog node was superseded by
+// newer modal content and should not be torn down by the old close.
+const LIVE_DIALOG_ATTRIBUTES = new Set([
+  'open',
+  'data-enter-ready',
+  'data-entered',
+  'data-utmr-history-advanced',
+  'data-utmr-skip-history-back'
+]);
 
 // Intercept frame renders for modal frames to use Idiomorph for flicker-free updates.
 // When turbo:before-frame-render fires, the response *contains* the modal frame,
@@ -161,7 +171,7 @@ const handleTurboBeforeFrameRender = (event) => {
   // Empty modal frames are initial loads. Let Turbo do its normal child
   // replacement so Stimulus sees a plain insertion and owns dialog opening.
   if (event.target.children.length === 0) return;
-  const wasClosing = event.target.querySelector('dialog.utmr[data-closing]') !== null;
+  const closingDialog = event.target.querySelector('dialog.utmr[data-closing]');
 
   // Morph subsequent in-frame updates to prevent flicker and avoid re-running
   // enter transitions on an already-open dialog.
@@ -180,7 +190,8 @@ const handleTurboBeforeFrameRender = (event) => {
           !(node.tagName === 'DIALOG' && LIVE_DIALOG_ATTRIBUTES.has(attributeName))
       }
     });
-    if (wasClosing) modal?.reviveAfterFrameMorph?.();
+    const controller = closingDialog?.__ultimateTurboModalController;
+    if (controller) controller.reviveAfterFrameMorph();
   };
 };
 

@@ -19,6 +19,7 @@ const scrollLockOwners = new Set();
 let scrollbarPaddingApplied = false;
 let savedPaddingRight = '';
 let compensatedFixedElements = [];
+let closeTokenSequence = 0;
 
 export default class extends Controller {
   static targets = ["container", "content"]
@@ -33,8 +34,10 @@ export default class extends Controller {
     this.turboFrame = this.element.closest('turbo-frame');
     this.hidingModal = this.containerTarget.hasAttribute('data-closing');
     this.originalUrl = window.location.href;
+    this.containerTarget.__ultimateTurboModalController = this;
 
     if (!dialogStack.includes(this)) dialogStack.push(this);
+    if (!this.hidingModal) delete this.turboFrame?.dataset.utmrCloseToken;
 
     // Same-page morphs can briefly disconnect/reconnect the controller while the
     // dialog is already open. Replaying showModal() there re-triggers the enter
@@ -92,6 +95,10 @@ export default class extends Controller {
     document.removeEventListener('keydown', this.keydownHandler);
     this.#releaseScrollLockSlot();
 
+    if (this.containerTarget.__ultimateTurboModalController === this) {
+      delete this.containerTarget.__ultimateTurboModalController;
+    }
+
     const idx = dialogStack.indexOf(this);
     if (idx !== -1) dialogStack.splice(idx, 1);
     window.modal = dialogStack[dialogStack.length - 1];
@@ -139,13 +146,17 @@ export default class extends Controller {
   hideModalWithPromise(options = {}) {
     return new Promise((resolve) => {
       const frame = this.turboFrame;
+      let timeout = null;
       const handler = () => {
-        frame.removeEventListener('modal:closed', handler);
+        frame?.removeEventListener('modal:closed', handler);
+        clearTimeout(timeout);
         resolve();
       };
-      frame.addEventListener('modal:closed', handler);
+      frame?.addEventListener('modal:closed', handler);
+      timeout = setTimeout(handler, this.#closeTimeoutMs() + 100);
       if (this.hideModal(options) === false) {
-        frame.removeEventListener('modal:closed', handler);
+        frame?.removeEventListener('modal:closed', handler);
+        clearTimeout(timeout);
         resolve();
       }
     });
@@ -237,13 +248,15 @@ export default class extends Controller {
     const historyWasAdvanced = this.#hasHistoryAdvanced();
     this.containerTarget.dataset.utmrHistoryAdvanced = String(historyWasAdvanced);
     this.containerTarget.dataset.utmrSkipHistoryBack = String(!!this._skipHistoryBack);
+    const closeToken = this.#stampCloseToken();
     this.#applyClosingState();
-    this.#queueCloseCleanup(historyWasAdvanced);
+    this.#queueCloseCleanup(historyWasAdvanced, closeToken);
   }
 
   #resumeClosing() {
     const historyWasAdvanced = this.containerTarget.dataset.utmrHistoryAdvanced == 'true';
     this._skipHistoryBack = this.containerTarget.dataset.utmrSkipHistoryBack == 'true';
+    const closeToken = this.turboFrame?.dataset.utmrCloseToken || this.#stampCloseToken();
 
     // Same-page morphs can reconnect the controller mid-close before the browser
     // has committed the leave transition. Re-arm the closing state on the
@@ -261,7 +274,7 @@ export default class extends Controller {
         if (!this.containerTarget.isConnected) return;
         this.#applyClosingState();
         this.closeFrames = null;
-        this.#queueCloseCleanup(historyWasAdvanced);
+        this.#queueCloseCleanup(historyWasAdvanced, closeToken);
       });
       this.closeFrames?.push(innerFrame);
     });
@@ -275,15 +288,21 @@ export default class extends Controller {
     this.#cancelEnter();
   }
 
-  #queueCloseCleanup(historyWasAdvanced) {
+  #stampCloseToken() {
+    const closeToken = String(++closeTokenSequence);
+    this._closeToken = closeToken;
+    if (this.turboFrame) this.turboFrame.dataset.utmrCloseToken = closeToken;
+    return closeToken;
+  }
+
+  #frameOwnsCloseToken(frame, closeToken) {
+    return !!closeToken && frame?.dataset.utmrCloseToken === closeToken;
+  }
+
+  #queueCloseCleanup(historyWasAdvanced, closeToken) {
     const dialog = this.containerTarget;
     const transitionTarget = this.#transitionTarget();
-    const closeTimeoutMs = this.#isDrawer() ? 750 : 300;
-    // The frame src this close belongs to. The cleanup below runs up to
-    // closeTimeoutMs later, after the leave transition -- by which time the
-    // user may have opened another modal, giving the frame a new src with a
-    // fetch in flight.
-    const closingSrc = this.turboFrame?.getAttribute("src") ?? null;
+    const closeTimeoutMs = this.#closeTimeoutMs();
     this.#cancelCloseCleanup();
 
     let cleaned = false;
@@ -292,35 +311,33 @@ export default class extends Controller {
       cleaned = true;
       this.#cancelCloseCleanup();
       const frame = this.turboFrame;
-      // Only clean up what still belongs to THIS close. If another modal has
-      // taken the frame over, its src is an in-flight fetch and the body's
-      // history-advanced flag is its close bookkeeping -- stripping either
-      // swallows the new modal's open, or leaves its close unable to consume
-      // its history entry.
-      const frameStillOurs = frame?.getAttribute("src") === closingSrc;
+      const frameStillOurs = this.#frameOwnsCloseToken(frame, closeToken);
       // The dialog node is not reliably ours either. handleTurboBeforeFrameRender
       // morphs in-frame updates onto the existing dialog, so a newer modal can
       // be living in the very node this close was started on. data-closing is
       // the tell: #applyClosingState sets it when the close begins and the
       // server never renders it, so a morph removes it.
       const dialogStillClosing = dialog.hasAttribute("data-closing");
-      if (dialogStillClosing) window.removeEventListener('popstate', this.popstateHandler);
+
       if (dialogStillClosing) {
+        window.removeEventListener('popstate', this.popstateHandler);
         try { dialog.close(); } catch (_) {}
-      }
-      if (frameStillOurs) {
-        try { frame.removeAttribute("src"); } catch (_) {}
-      }
-      if (dialogStillClosing) {
         try { dialog.remove(); } catch (_) {}
         delete dialog.dataset.utmrHistoryAdvanced;
         delete dialog.dataset.utmrSkipHistoryBack;
         this.#releaseScrollbarCompensation();
       }
-      if (dialogStillClosing && frameStillOurs) this.#resetHistoryAdvanced();
-      if (dialogStillClosing && frameStillOurs) {
-        try { frame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
+
+      if (frameStillOurs) {
+        try { frame.removeAttribute("src"); } catch (_) {}
+        delete frame.dataset.utmrCloseToken;
       }
+
+      if (dialogStillClosing && frameStillOurs) {
+        this.#resetHistoryAdvanced();
+      }
+
+      try { frame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
 
       // Go back in history AFTER the dialog is removed and animation is done.
       // This triggers Turbo's popstate navigation to restore the previous page.
@@ -337,6 +354,10 @@ export default class extends Controller {
     this.closeTimeout = setTimeout(cleanup, closeTimeoutMs);
   }
 
+  #closeTimeoutMs() {
+    return this.#isDrawer() ? 750 : 300;
+  }
+
   // Quick cleanup without animation — used when the browser back button
   // is pressed and Turbo is already navigating to the previous page.
   #immediateCleanup() {
@@ -345,8 +366,12 @@ export default class extends Controller {
     this.#cancelCloseCleanup();
     const dialog = this.containerTarget;
     const frame = this.turboFrame;
+    const frameStillOurs = dialog.closest('turbo-frame') === frame;
     try { dialog.close(); } catch (_) {}
-    try { frame.removeAttribute("src"); } catch (_) {}
+    if (frameStillOurs) {
+      try { frame.removeAttribute("src"); } catch (_) {}
+      delete frame.dataset.utmrCloseToken;
+    }
     try { dialog.remove(); } catch (_) {}
     this.#releaseScrollbarCompensation();
     try { frame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
