@@ -27,6 +27,9 @@ Rails.application.routes.draw do
         get :supersede_close
       end
     end
+    get "chat", to: "chats#show", as: :chat
+    post "chat/messages", to: "chats#create_message", as: :chat_messages
+    post "chat/clear", to: "chats#clear", as: :chat_clear
     root to: "welcome#index"
   end
 
