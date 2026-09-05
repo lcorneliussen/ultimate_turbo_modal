@@ -22,6 +22,13 @@ let compensatedFixedElements = [];
 let closeTokenSequence = 0;
 
 export default class extends Controller {
+  // Resolvers for in-flight hideModalWithPromise() calls. A close can end
+  // without the dialog ever closing -- a morph can supersede it, or the
+  // controller can disconnect -- and those callers still have to be released.
+  // They are settled directly rather than through modal:closed so that event
+  // keeps meaning "this dialog is closed and gone".
+  #closeWaiters = new Set()
+
   static targets = ["container", "content"]
   static values = {
     advanceUrl: String,
@@ -95,6 +102,7 @@ export default class extends Controller {
     document.removeEventListener('turbo:before-cache', this.beforeCacheHandler);
     document.removeEventListener('keydown', this.keydownHandler);
     this.#releaseScrollLockSlot();
+    this.#settleCloseWaiters();
 
     if (this.containerTarget.__ultimateTurboModalController === this) {
       delete this.containerTarget.__ultimateTurboModalController;
@@ -148,19 +156,28 @@ export default class extends Controller {
     return new Promise((resolve) => {
       const frame = this.turboFrame;
       let timeout = null;
-      const handler = () => {
-        frame?.removeEventListener('modal:closed', handler);
+      let settled = false;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        frame?.removeEventListener('modal:closed', settle);
+        this.#closeWaiters.delete(settle);
         clearTimeout(timeout);
         resolve();
       };
-      frame?.addEventListener('modal:closed', handler);
-      timeout = setTimeout(handler, this.#closeTimeoutMs() + 100);
-      if (this.hideModal(options) === false) {
-        frame?.removeEventListener('modal:closed', handler);
-        clearTimeout(timeout);
-        resolve();
-      }
+      this.#closeWaiters.add(settle);
+      frame?.addEventListener('modal:closed', settle);
+      // Last resort. Every path that ends a close settles its waiters, but a
+      // caller awaiting this promise must never hang on a missed one.
+      timeout = setTimeout(settle, this.#closeTimeoutMs() + 100);
+      if (this.hideModal(options) === false) settle();
     });
+  }
+
+  #settleCloseWaiters() {
+    const waiters = Array.from(this.#closeWaiters);
+    this.#closeWaiters.clear();
+    waiters.forEach(settle => settle());
   }
 
   hide() {
@@ -172,7 +189,6 @@ export default class extends Controller {
   }
 
   reviveAfterFrameMorph() {
-    const wasClosing = this.hidingModal;
     this.#cancelResumeClosing();
     this.#cancelCloseCleanup();
     if (this.#frameOwnsCloseToken(this.turboFrame, this._closeToken)) {
@@ -194,10 +210,10 @@ export default class extends Controller {
       this.containerTarget.setAttribute('data-entered', '');
     }
 
-    // Supersession finishes this close even though the reused dialog stays open.
-    if (wasClosing) {
-      try { this.turboFrame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
-    }
+    // The close is over, but it was cancelled rather than completed: this
+    // dialog is on screen with newer content. Release anyone awaiting it
+    // without claiming it closed.
+    this.#settleCloseWaiters();
   }
 
   refreshPage() {
@@ -275,17 +291,16 @@ export default class extends Controller {
     const historyWasAdvanced = this.#hasHistoryAdvanced();
     this.containerTarget.dataset.utmrHistoryAdvanced = String(historyWasAdvanced);
     this.containerTarget.dataset.utmrSkipHistoryBack = String(!!this._skipHistoryBack);
-    const closeToken = this.#stampCloseToken();
+    this.#stampCloseToken();
     this.#applyClosingState();
-    this.#queueCloseCleanup(historyWasAdvanced, closeToken);
+    this.#queueCloseCleanup(historyWasAdvanced);
   }
 
   #resumeClosing() {
     const historyWasAdvanced = this.containerTarget.dataset.utmrHistoryAdvanced == 'true';
     this._skipHistoryBack = this.containerTarget.dataset.utmrSkipHistoryBack == 'true';
     // Reconnecting cannot reclaim a frame that a newer request already owns.
-    const closeToken = this.containerTarget.dataset.utmrCloseToken;
-    this._closeToken = closeToken;
+    this._closeToken = this.containerTarget.dataset.utmrCloseToken;
 
     // Same-page morphs can reconnect the controller mid-close before the browser
     // has committed the leave transition. Re-arm the closing state on the
@@ -303,7 +318,7 @@ export default class extends Controller {
         if (!this.containerTarget.isConnected) return;
         this.#applyClosingState();
         this.closeFrames = null;
-        this.#queueCloseCleanup(historyWasAdvanced, closeToken);
+        this.#queueCloseCleanup(historyWasAdvanced);
       });
       this.closeFrames?.push(innerFrame);
     });
@@ -329,7 +344,35 @@ export default class extends Controller {
     return !!closeToken && frame?.dataset.utmrCloseToken === closeToken;
   }
 
-  #queueCloseCleanup(historyWasAdvanced, closeToken) {
+  // Neither the dialog node nor the frame is unconditionally ours by the time
+  // cleanup runs, so both cleanup paths ask these two questions.
+  //
+  // handleTurboBeforeFrameRender morphs in-frame updates onto the existing
+  // dialog, so a newer modal can be living in the very node this close was
+  // started on. data-closing is the tell: #applyClosingState sets it when the
+  // close begins and the server never renders it, so a morph removes it.
+  // Outside a close nothing has superseded us, so the node is ours.
+  #stillOwnsDialog() {
+    if (!this.hidingModal) return true;
+    // #resumeClosing clears data-closing for two frames while it re-arms the
+    // leave animation on a reconnected node. The dialog is still ours there.
+    if (this.closeFrames) return true;
+    return this.containerTarget.hasAttribute('data-closing');
+  }
+
+  // Mid-close a newer request or a newer modal may already own the frame, and
+  // the close token is the only reliable tell -- a src comparison reads equal
+  // for stream-delivered modals and for reopening the same URL. Outside a close
+  // nothing else has stamped the frame, so containment is enough.
+  #stillOwnsFrame() {
+    const frame = this.turboFrame;
+    if (!frame) return false;
+    return this.hidingModal
+      ? this.#frameOwnsCloseToken(frame, this._closeToken)
+      : this.containerTarget.closest('turbo-frame') === frame;
+  }
+
+  #queueCloseCleanup(historyWasAdvanced) {
     const dialog = this.containerTarget;
     const transitionTarget = this.#transitionTarget();
     const closeTimeoutMs = this.#closeTimeoutMs();
@@ -341,15 +384,10 @@ export default class extends Controller {
       cleaned = true;
       this.#cancelCloseCleanup();
       const frame = this.turboFrame;
-      const frameStillOurs = this.#frameOwnsCloseToken(frame, closeToken);
-      // The dialog node is not reliably ours either. handleTurboBeforeFrameRender
-      // morphs in-frame updates onto the existing dialog, so a newer modal can
-      // be living in the very node this close was started on. data-closing is
-      // the tell: #applyClosingState sets it when the close begins and the
-      // server never renders it, so a morph removes it.
-      const dialogStillClosing = dialog.hasAttribute("data-closing");
+      const frameStillOurs = this.#stillOwnsFrame();
+      const dialogStillOurs = this.#stillOwnsDialog();
 
-      if (dialogStillClosing) {
+      if (dialogStillOurs) {
         window.removeEventListener('popstate', this.popstateHandler);
         try { dialog.close(); } catch (_) {}
         try { dialog.remove(); } catch (_) {}
@@ -364,15 +402,23 @@ export default class extends Controller {
         delete frame.dataset.utmrCloseToken;
       }
 
-      if (dialogStillClosing && frameStillOurs) {
+      // Only consume the history entry when the replacement modal will not
+      // inherit it. When the frame has moved on, leaving the body flag set
+      // stops that modal pushing a second entry, and its own close spends this
+      // one -- and history.back() here would kick off a restoration visit that
+      // races the incoming frame render.
+      if (dialogStillOurs && frameStillOurs) {
         this.#resetHistoryAdvanced();
       }
 
-      try { frame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
+      if (dialogStillOurs) {
+        try { frame?.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
+      }
+      this.#settleCloseWaiters();
 
       // Go back in history AFTER the dialog is removed and animation is done.
       // This triggers Turbo's popstate navigation to restore the previous page.
-      if (dialogStillClosing && frameStillOurs && historyWasAdvanced && !this._skipHistoryBack) history.back();
+      if (dialogStillOurs && frameStillOurs && historyWasAdvanced && !this._skipHistoryBack) history.back();
     };
 
     const onTransitionEnd = (e) => {
@@ -392,20 +438,34 @@ export default class extends Controller {
   // Quick cleanup without animation — used when the browser back button
   // is pressed and Turbo is already navigating to the previous page.
   #immediateCleanup() {
+    // Read ownership before cancelling, since #cancelResumeClosing closes the
+    // window #stillOwnsDialog uses to recognise a reconnecting close.
+    const dialogStillOurs = this.#stillOwnsDialog();
+    const frameStillOurs = this.#stillOwnsFrame();
     this.#cancelEnter();
     this.#cancelResumeClosing();
     this.#cancelCloseCleanup();
     const dialog = this.containerTarget;
     const frame = this.turboFrame;
-    const frameStillOurs = dialog.closest('turbo-frame') === frame;
-    try { dialog.close(); } catch (_) {}
+
+    if (dialogStillOurs) {
+      try { dialog.close(); } catch (_) {}
+      try { dialog.remove(); } catch (_) {}
+      delete dialog.dataset.utmrCloseToken;
+      delete dialog.dataset.utmrHistoryAdvanced;
+      delete dialog.dataset.utmrSkipHistoryBack;
+      this.#releaseScrollbarCompensation();
+    }
+
     if (frameStillOurs) {
       try { frame.removeAttribute("src"); } catch (_) {}
       delete frame.dataset.utmrCloseToken;
     }
-    try { dialog.remove(); } catch (_) {}
-    this.#releaseScrollbarCompensation();
-    try { frame.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
+
+    if (dialogStillOurs) {
+      try { frame?.dispatchEvent(new Event('modal:closed', { cancelable: false })); } catch (_) {}
+    }
+    this.#settleCloseWaiters();
   }
 
   // Remove any stale dialogs of the same kind left over from a previous failed

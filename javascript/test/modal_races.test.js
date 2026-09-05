@@ -62,7 +62,7 @@ test('outer-frame morph preserves the live dialog and controller-owned attribute
   assert.deepEqual(result, { sameNode: true, open: true, entered: true, history: 'true', skip: 'true', text: 'Updated' });
 });
 
-test('superseded close completes once without consuming history or closing its replacement', async () => {
+test('superseded close settles waiters without firing modal:closed or consuming history', async () => {
   const result = await page.evaluate(async () => {
     document.body.dataset.turboModalHistoryAdvanced = 'true';
     const controller = window.modal;
@@ -79,10 +79,12 @@ test('superseded close completes once without consuming history or closing its r
       historyAdvanced: document.body.dataset.turboModalHistoryAdvanced
     };
   });
-  assert.deepEqual(result, { closedAtRevival: 1, closed: 1, open: true, hiding: false, token: null, historyBack: 0, historyAdvanced: 'true' });
+  // The dialog is on screen with newer content, so the close was cancelled,
+  // not completed: hideModalWithPromise resolves but modal:closed never fires.
+  assert.deepEqual(result, { closedAtRevival: 0, closed: 0, open: true, hiding: false, token: null, historyBack: 0, historyAdvanced: 'true' });
   await page.evaluate(() => window.modal.hideModal());
   await page.waitForFunction(() => !document.querySelector('dialog'));
-  assert.equal(await page.evaluate(() => window.closedEvents), 2);
+  assert.equal(await page.evaluate(() => window.closedEvents), 1);
   assert.equal(await page.evaluate(() => window.historyBackCalls), 1);
 });
 
@@ -98,7 +100,7 @@ test('close beginning after before-frame-render revives at actual render time', 
   assert.deepEqual(result, { open: true, entered: true, hiding: false });
 });
 
-test('a replacement request survives the old close deadline', async () => {
+test('a replacement request survives the old close deadline without reopening the dismissed modal', async () => {
   await page.route('http://utm.test/slow', async route => {
     await new Promise(resolve => setTimeout(resolve, 600));
     await route.fulfill({
@@ -106,10 +108,15 @@ test('a replacement request survives the old close deadline', async () => {
       body: '<turbo-frame id="modal"><dialog id="modal-container" class="utmr" data-controller="modal" data-modal-target="container"><div id="modal-inner" data-modal-target="content">Slow replacement</div></dialog></turbo-frame>'
     });
   });
-  await page.evaluate(() => {
+  const midRequest = await page.evaluate(async () => {
     window.modal.hideModal();
     Turbo.visit('/slow', { frame: 'modal' });
+    // Past the close deadline, still short of the response.
+    await new Promise(resolve => setTimeout(resolve, 450));
+    return { onScreen: !!document.querySelector('dialog[open]'), closed: window.closedEvents };
   });
+  // The user dismissed it, so it stays dismissed while the replacement loads.
+  assert.deepEqual(midRequest, { onScreen: false, closed: 1 });
   await page.waitForFunction(() => document.querySelector('dialog[open]')?.textContent === 'Slow replacement', null, { timeout: 3000 });
   assert.equal(await page.locator('#modal').getAttribute('src'), 'http://utm.test/slow');
   assert.equal(await page.evaluate(() => window.closedEvents), 1);
@@ -152,7 +159,7 @@ test('hover prefetch does not supersede an advanced modal close', async () => {
   assert.equal(await page.evaluate(() => window.historyBackCalls), 1);
 });
 
-test('failed replacement keeps the current modal and history handling usable', async () => {
+test('failed replacement leaves the dismissed modal closed and its history entry unspent', async () => {
   await page.route('http://utm.test/failed', async route => {
     await new Promise(resolve => setTimeout(resolve, 600));
     await route.abort('failed');
@@ -165,12 +172,16 @@ test('failed replacement keeps the current modal and history handling usable', a
   });
   await failedRequest;
   await page.waitForFunction(() => !document.getElementById('modal').hasAttribute('busy'));
-  assert.equal(await page.locator('dialog[open]').count(), 1);
-  assert.equal(await page.evaluate(() => window.modal.hidingModal), false);
+  // Dismissing it meant dismissing it, so a replacement that never arrives
+  // leaves nothing behind.
+  assert.equal(await page.locator('dialog').count(), 0);
+  assert.equal(await page.evaluate(() => window.modal), undefined);
+  assert.equal(await page.evaluate(() => window.closedEvents), 1);
+  // The frame had already moved on, so the close left the history entry for a
+  // replacement to inherit. The next advanced modal reuses it instead of
+  // pushing a second one, keeping the entry count balanced.
   assert.equal(await page.evaluate(() => window.historyBackCalls), 0);
-  await page.evaluate(() => window.modal.hideModal());
-  await page.waitForFunction(() => !document.querySelector('dialog'));
-  assert.equal(await page.evaluate(() => window.historyBackCalls), 1);
+  assert.equal(await page.evaluate(() => document.body.dataset.turboModalHistoryAdvanced), 'true');
   // Turbo propagates the deliberately failed fetch as an unhandled rejection.
   errors = errors.filter(message => message !== 'Failed to fetch');
 });
@@ -210,5 +221,5 @@ test('morph during reconnect supersedes the close before its animation resumes',
     await new Promise(resolve => setTimeout(resolve, 450));
     return { resuming, connected: dialog.isConnected, open: dialog.open, entered: dialog.hasAttribute('data-entered'), hiding: controller.hidingModal, closed: window.closedEvents };
   });
-  assert.deepEqual(result, { resuming: true, connected: true, open: true, entered: true, hiding: false, closed: 1 });
+  assert.deepEqual(result, { resuming: true, connected: true, open: true, entered: true, hiding: false, closed: 0 });
 });

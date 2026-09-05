@@ -154,8 +154,15 @@ const LIVE_DIALOG_ATTRIBUTES = new Set([
   'data-utmr-skip-history-back'
 ]);
 
-// A new request owns the frame before its response connects a controller.
-// Invalidate the old close now so its timeout cannot cancel a slower request.
+// A new request owns the frame before its response connects a controller, so
+// release the frame from the old close now. Without this, that close is still
+// on its timer and would strip the src and consume history out from under the
+// incoming modal.
+//
+// A modal that is already closing stays closing. The user dismissed it, so it
+// finishes its leave animation and is removed on schedule; the replacement
+// opens fresh when it lands, and if the request fails no modal remains --
+// which is what dismissing it asked for.
 const handleTurboBeforeFetchRequest = (event) => {
   // Hover prefetches carry the same frame header but do not navigate the frame.
   if (!isModalFrameTarget(event) && !(event.target instanceof HTMLFormElement)) return;
@@ -164,14 +171,6 @@ const handleTurboBeforeFetchRequest = (event) => {
   const frame = document.getElementById(frameId);
   if (!frame) return;
   delete frame.dataset.utmrCloseToken;
-  const dialog = Array.from(frame.querySelectorAll('dialog.utmr')).find(node => {
-    const controller = node.__ultimateTurboModalController;
-    return controller?.hidingModal && controller.turboFrame === frame;
-  });
-  const controller = dialog?.__ultimateTurboModalController;
-  // Keep the existing modal usable while the replacement loads, including if
-  // that request fails. Its close is already superseded by the navigation.
-  if (controller?.turboFrame === frame) controller.reviveAfterFrameMorph();
 };
 
 document.removeEventListener('turbo:before-fetch-request', handleTurboBeforeFetchRequest);
